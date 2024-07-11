@@ -7,9 +7,11 @@ import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
+import java.text.SimpleDateFormat;
 import java.util.*;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * Monitoring class responsible for tracking sensor status and sending email
@@ -17,24 +19,9 @@ import java.util.concurrent.BlockingQueue;
  */
 public class Monitoring {
     /**
-     * Interval in milliseconds between signal checks.
+     * Map of sensor IDs to Sensor objects.
      */
-    public int signalInterval = 5000;
-
-    /**
-     * Map of sensor IDs to email addresses.
-     */
-    private final Map<Integer, List<String>> idToEmailMap = new HashMap<>();
-
-    /**
-     * Map of sensor IDs to last signal times.
-     */
-    private final Map<Integer, Long> idToLastSignalTimeMap = new HashMap<>();
-
-    /**
-     * Map of sensor IDs to current status (online/offline).
-     */
-    private final Map<Integer, String> idToStatusMap = new HashMap<>();
+    private final Map<Integer, Sensor> sensors = new ConcurrentHashMap<>();
 
     /**
      * Logger instance for logging events.
@@ -61,48 +48,109 @@ public class Monitoring {
         startEmailProcessor();
     }
 
+
     /**
      * Loads sensor data from the database.
      */
     private void loadSensorData() {
-        String query = "SELECT id, email, sensor_id FROM emails";
+        String timestampTable = Config.getTimestampTable();
+        String timestampSensorIdColumn = Config.getTimestampSensorIdColumn();
+        String timestampColumn = Config.getTimestampColumn();
+
+        String timestampQuery = String.format("SELECT %s, MAX(%s) AS latestTimestamp FROM %s GROUP BY %s",
+                timestampSensorIdColumn, timestampColumn, timestampTable, timestampSensorIdColumn);
+
         try (Connection conn = DatabaseConfig.getConnection();
-                PreparedStatement stmt = conn.prepareStatement(query);
-                ResultSet rs = stmt.executeQuery()) {
+             PreparedStatement stmt = conn.prepareStatement(timestampQuery);
+             ResultSet rs = stmt.executeQuery()) {
 
             while (rs.next()) {
-                int sensorId = rs.getInt("sensor_id");
-                String email = rs.getString("email");
+                int sensorId = rs.getInt(timestampSensorIdColumn);
+                String latestTimestamp = rs.getString("latestTimestamp");
 
-                idToEmailMap.computeIfAbsent(sensorId, k -> new ArrayList<>()).add(email);
-                idToStatusMap.putIfAbsent(sensorId, "online"); // Initialize all sensors as offline
-                idToLastSignalTimeMap.putIfAbsent(sensorId, System.currentTimeMillis());
+                sensors.putIfAbsent(sensorId, new Sensor(sensorId, "online", new ArrayList<>(), 0));
+                sensors.get(sensorId).setLastTimestamp(latestTimestamp);
             }
         } catch (SQLException e) {
             logger.error("Error loading sensor data from database: ", e);
         }
-    }
 
-    /**
-     * Prints the sensor ID to email map for debugging purposes.
-     */
-    public void printIdToEmailMap() {
-        idToEmailMap.forEach((sensorId, emails) -> logger
-                .info("Sensor ID: " + sensorId + " Status: " + idToStatusMap.get(sensorId) + ", Emails: " + emails));
-    }
+        String emailTable = Config.getEmailTable();
+        String emailSensorIdColumn = Config.getEmailSensorIdColumn();
+        String emailColumn = Config.getEmailColumn();
 
-    /**
-     * Signals that a sensor has sent a signal.
-     *
-     * @param sensorId the ID of the sensor that sent the signal
-     */
-    public void signalReceived(int sensorId) {
-        try {
-            signalQueue.put(sensorId);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            logger.error("Error adding signal to queue: ", e);
+        String emailQuery = String.format("SELECT %s, %s FROM %s",
+                emailSensorIdColumn, emailColumn, emailTable);
+
+        try (Connection conn = DatabaseConfig.getConnection();
+             PreparedStatement emailStmt = conn.prepareStatement(emailQuery);
+             ResultSet emailRs = emailStmt.executeQuery()) {
+
+            while (emailRs.next()) {
+                int sensorId = emailRs.getInt(emailSensorIdColumn);
+                String email = emailRs.getString(emailColumn);
+
+                sensors.computeIfAbsent(sensorId, k -> new Sensor(sensorId, "online", new ArrayList<>(), 0)).getEmails().add(email);
+            }
+        } catch (SQLException e) {
+            logger.error("Error loading email data from database: ", e);
         }
+        String intervalTable = Config.getIntervalTable();
+        String intervalSensorIdColumn = Config.getIntervalSensorIdColumn();
+        String intervalColumn = Config.getIntervalColumn();
+
+        String intervalQuery = String.format("SELECT %s, %s FROM %s",
+                intervalSensorIdColumn, intervalColumn, intervalTable);
+
+        try (Connection conn = DatabaseConfig.getConnection();
+             PreparedStatement intervalStmt = conn.prepareStatement(intervalQuery);
+             ResultSet intervalRs = intervalStmt.executeQuery()) {
+
+            while (intervalRs.next()) {
+                int sensorId = intervalRs.getInt(intervalSensorIdColumn);
+                int interval = intervalRs.getInt(intervalColumn);
+
+                sensors.computeIfAbsent(sensorId, k -> new Sensor(sensorId, "online", new ArrayList<>(), 0)).setInterval(interval);
+            }
+        } catch (SQLException e) {
+            logger.error("Error loading interval data from database: ", e);
+        }
+    }
+
+    private void updateAllSensorTimestamps() {
+        String timestampTable = Config.getTimestampTable();
+        String timestampSensorIdColumn = Config.getTimestampSensorIdColumn();
+        String timestampColumn = Config.getTimestampColumn();
+
+        String query = String.format("SELECT %s, MAX(%s) AS latestTimestamp FROM %s GROUP BY %s",
+                timestampSensorIdColumn, timestampColumn, timestampTable, timestampSensorIdColumn);
+
+        try (Connection conn = DatabaseConfig.getConnection();
+             PreparedStatement stmt = conn.prepareStatement(query);
+             ResultSet rs = stmt.executeQuery()) {
+
+            while (rs.next()) {
+                int sensorId = rs.getInt(timestampSensorIdColumn);
+                String latestTimestamp = rs.getString("latestTimestamp");
+                Sensor sensor = sensors.get(sensorId);
+                if (sensor != null) {
+                    sensor.setLastTimestamp(latestTimestamp);
+                }
+            }
+            logger.info("Updated timestamp");
+        } catch (SQLException e) {
+            logger.error("Error updating sensor timestamps from database: ", e);
+        }
+    }
+
+
+
+    /**
+     * Prints the sensor data for debugging purposes.
+     */
+    public void printSensors() {
+        sensors.forEach((sensorId, sensor) -> logger.info("Sensor ID: " + sensor.getId() +
+                " Status: " + sensor.getStatus() + ", Last Timestamp: " + sensor.getLastTimestamp() + ", Emails: " + sensor.getEmails() + ", Time intervals: " + sensor.getInterval() + "min"));
     }
 
     /**
@@ -110,11 +158,11 @@ public class Monitoring {
      */
     private void startSignalProcessor() {
         Thread signalProcessorThread = new Thread(() -> {
-            while (true) {
+            while (!Thread.currentThread().isInterrupted()) {
                 try {
                     int sensorId = signalQueue.take();
-                    idToLastSignalTimeMap.put(sensorId, System.currentTimeMillis());
-                    updateSensorStatus(sensorId, "online");
+                    sensors.get(sensorId).setStatus("online");
+                    sensors.get(sensorId).setLastTimestamp(new Date().toString());
                     logger.info("Processed signal for sensor ID: " + sensorId);
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
@@ -130,12 +178,19 @@ public class Monitoring {
      * Checks the status of all sensors and updates their status if necessary.
      */
     public void checkSensors() {
+        updateAllSensorTimestamps();
         long currentTime = System.currentTimeMillis();
-        idToLastSignalTimeMap.forEach((sensorId, lastSignalTime) -> {
-            if (currentTime - lastSignalTime > signalInterval) {
-                updateSensorStatus(sensorId, "offline");
-            } else {
-                updateSensorStatus(sensorId, "online");
+        sensors.forEach((sensorId, sensor) -> {
+            try {
+                long lastSignalTime = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss").parse(sensor.getLastTimestamp()).getTime();
+                long intervalMillis = (long) sensor.getInterval() * 60 * 1000; // Convert interval to milliseconds
+                if (currentTime - lastSignalTime > intervalMillis) {
+                    updateSensorStatus(sensorId, "offline");
+                } else {
+                    updateSensorStatus(sensorId, "online");
+                }
+            } catch (Exception e) {
+                logger.error("Error parsing timestamp for sensor ID: " + sensorId, e);
             }
         });
     }
@@ -148,11 +203,13 @@ public class Monitoring {
      * @param newStatus the new status of the sensor (online/offline)
      */
     private void updateSensorStatus(int sensorId, String newStatus) {
-        String currentStatus = idToStatusMap.get(sensorId);
+        Sensor sensor = sensors.get(sensorId);
+        String currentStatus = sensor.getStatus();
         if (!newStatus.equals(currentStatus)) {
-            idToStatusMap.put(sensorId, newStatus);
+            sensor.setStatus(newStatus);
             try {
                 emailQueue.put(sensorId); // Add to queue when status changes
+                logger.info("Status changed for sensor ID: " + sensorId + " to " + newStatus);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 logger.error("Error adding status change to queue: ", e);
@@ -165,10 +222,11 @@ public class Monitoring {
      */
     private void startEmailProcessor() {
         Thread emailProcessorThread = new Thread(() -> {
-            while (true) {
+            while (!Thread.currentThread().isInterrupted()) {
                 try {
                     int sensorId = emailQueue.take();
                     sendEmail(sensorId);
+
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
                     logger.error("Email processor interrupted: ", e);
@@ -185,10 +243,10 @@ public class Monitoring {
      * @param sensorId the ID of the sensor that triggered the email
      */
     private void sendEmail(int sensorId) {
-        List<String> emails = idToEmailMap.get(sensorId);
-        if (emails != null) {
-            String status = idToStatusMap.get(sensorId);
-            for (String email : emails) {
+        Sensor sensor = sensors.get(sensorId);
+        if (sensor != null) {
+            String status = sensor.getStatus();
+            for (String email : sensor.getEmails()) {
                 if ("offline".equals(status)) {
                     logger.info("Sending email to: " + email + " - Sensor ID " + sensorId + " is offline.");
                 } else {
@@ -198,10 +256,9 @@ public class Monitoring {
             logger.info("Email sent for sensor ID: " + sensorId);
         }
     }
-
     public static void main(String[] args) {
         Monitoring monitoring = new Monitoring();
-        monitoring.printIdToEmailMap();
+        monitoring.printSensors();
         Timer timer = new Timer();
         timer.scheduleAtFixedRate(new TimerTask() {
             @Override
@@ -209,6 +266,6 @@ public class Monitoring {
                 logger.info("Checking sensors");
                 monitoring.checkSensors();
             }
-        }, 0, monitoring.signalInterval);
+        }, 0, Config.getCheckInterval());
     }
 }
